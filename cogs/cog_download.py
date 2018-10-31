@@ -1,209 +1,710 @@
-﻿import discord
-import os
-import requests
-import pip
-from github import Github
-import json
 from discord.ext import commands
-from bs4 import BeautifulSoup
-from cogs.utils.checks import parse_prefix
+from cogs.utils.dataIO import dataIO
+from cogs.utils import checks
+from cogs.utils.chat_formatting import pagify, box
+from __main__ import send_cmd_help, set_cog
+import os
+from subprocess import run as sp_run, PIPE
+import shutil
+from asyncio import as_completed
+from setuptools import distutils
+import discord
+from functools import partial
+from concurrent.futures import ThreadPoolExecutor
+from time import time
+from importlib.util import find_spec
+from copy import deepcopy
 
-"""Cog for cog downloading."""
+NUM_THREADS = 4
+REPO_NONEX = 0x1
+REPO_CLONE = 0x2
+REPO_SAME = 0x4
+REPOS_LIST = "https://twentysix26.github.io/Red-Docs/red_cog_approved_repos/"
+WINDOWS_OS = os.name == 'nt'
+
+DISCLAIMER = ("You're about to add a 3rd party repository. The creator of Red"
+              " and its community have no responsibility for any potential "
+              "damage that the content of 3rd party repositories might cause."
+              "\nBy typing 'I agree' you declare to have read and understand "
+              "the above message. This message won't be shown again until the"
+              " next reboot.")
 
 
-class CogDownloading:
+class UpdateError(Exception):
+    pass
+
+
+class CloningError(UpdateError):
+    pass
+
+
+class RequirementFail(UpdateError):
+    pass
+
+
+class Downloader:
+    """Cog downloader/installer."""
 
     def __init__(self, bot):
         self.bot = bot
+        self.disclaimer_accepted = False
+        self.path = os.path.join("data", "downloader")
+        self.file_path = os.path.join(self.path, "repos.json")
+        # {name:{url,cog1:{installed},cog1:{installed}}}
+        self.repos = dataIO.load_json(self.file_path)
+        self.executor = ThreadPoolExecutor(NUM_THREADS)
+        self._do_first_run()
 
-    async def github_upload(self, username, password, repo_name, link, file_name):
-        g = Github(username, password)
-        repo = g.get_user().get_repo(repo_name)
-        req = requests.get(link)
-        if req.encoding != "utf-8":
-            filecontent = req.text.encode("utf-8")
-        else:
-            filecontent = req.text
-        repo.create_file('/custom_cogs/' + file_name, 'Commiting file: ' + file_name + ' to GitHub', filecontent)
+    def save_repos(self):
+        dataIO.save_json(self.file_path, self.repos)
 
     @commands.group(pass_context=True)
+    @checks.is_owner()
     async def cog(self, ctx):
-        """Manage custom cogs from ASCII. [p]help cog for more information.
-        
-        The Appu Selfbot Cog Importable Index (aka ASCII) is a server that hosts custom cogs for the bot.
-        [p]cog install <cog> - Install a custom cog from ASCII.
-        [p]cog uninstall <cog> - Uninstall one of your ASCII cogs.
-        [p]cog list - List all cogs on ASCII.
-        [p]cog view <cog> - View information about a cog on ASCII.
-        [p]cog update - Update all of your ASCII cogs.
-        If you would like to add a custom cog to ASCII, see http://appucogs.tk
-        """
+        """Additional cogs management"""
         if ctx.invoked_subcommand is None:
-            await ctx.message.delete()
-            await ctx.send(self.bot.bot_prefix + "Invalid usage. Valid subcommands: `list`, `install`, `uninstall`, `view`, `update`\nDo `help cog` for more information.")
+            await send_cmd_help(ctx)
 
-    @cog.command(pass_context=True)
-    async def install(self, ctx, cog):
-        """Install a custom cog from ASCII."""
-        def check(msg):
+    @cog.group(pass_context=True)
+    async def repo(self, ctx):
+        """Repo management commands"""
+        if ctx.invoked_subcommand is None or \
+                isinstance(ctx.invoked_subcommand, commands.Group):
+            await send_cmd_help(ctx)
+            return
+
+    @repo.command(name="add", pass_context=True)
+    async def _repo_add(self, ctx, repo_name: str, repo_url: str):
+        """Adds repo to available repo lists
+        Warning: Adding 3RD Party Repositories is at your own
+        Risk."""
+        if not self.disclaimer_accepted:
+            await self.bot.say(DISCLAIMER)
+            answer = await self.bot.wait_for_message(timeout=30,
+                                                     author=ctx.message.author)
+            if answer is None:
+                await self.bot.say('Not adding repo.')
+                return
+            elif "i agree" not in answer.content.lower():
+                await self.bot.say('Not adding repo.')
+                return
+            else:
+                self.disclaimer_accepted = True
+        self.repos[repo_name] = {}
+        self.repos[repo_name]['url'] = repo_url
+        try:
+            self.update_repo(repo_name)
+        except CloningError:
+            await self.bot.say("That repository link doesn't seem to be "
+                               "valid.")
+            del self.repos[repo_name]
+            return
+        except FileNotFoundError:
+            error_message = ("I couldn't find git. The downloader needs it "
+                             "for it to properly work.")
+            if WINDOWS_OS:
+                error_message += ("\nIf you just installed it you may need "
+                                  "a reboot for it to be seen into the PATH "
+                                  "environment variable.")
+            await self.bot.say(error_message)
+            return
+        self.populate_list(repo_name)
+        self.save_repos()
+        data = self.get_info_data(repo_name)
+        if data:
+            msg = data.get("INSTALL_MSG")
             if msg:
-                return (msg.content.lower().strip() == 'y' or msg.content.lower().strip() == 'n') and msg.author == self.bot.user
-            else:
-                return False
+                await self.bot.say(msg[:2000])
+        await self.bot.say("Repo '{}' added.".format(repo_name))
 
-        await ctx.message.delete()
-        response = requests.get("https://lyricly.github.io/ASCII/cogs/{}.json".format(cog))
-        if response.status_code == 404:
-            await ctx.send(self.bot.bot_prefix + "That cog couldn't be found on the network. Check your spelling and try again.")
-        else:
-            cog = response.json()
-            embed = discord.Embed(title=cog["title"], description=cog["description"])
-            embed.set_author(name=cog["author"])
-            await ctx.send(self.bot.bot_prefix + "Are you sure you want to download this cog? (y/n)", embed=embed)
-            reply = await self.bot.wait_for("message", check=check)
-            if reply.content.lower() == "y":
-                coglink = cog["link"]
-                download = requests.get(cog["link"]).text
-                filename = cog["link"].rsplit("/", 1)[1]
-                if "dependencies" in cog:
-                    for dep in cog["dependencies"]:
-                        try:
-                            pip.main(["install","--user",dep])
-                        except:
-                            await ctx.send("{}Warning: dependency {} could not be resolved. Cog may not function as intended".format(self.bot.bot_prefix, dep))
-                with open("settings/github.json", "r+") as fp:
-                    opt = json.load(fp)
-                    if opt['username'] != "":
-                        try:
-                            await ctx.send(self.bot.bot_prefix + "Uploading to GitHub. Heroku users, wait for the bot to restart.")
-                            await self.github_upload(opt['username'], opt['password'], opt['reponame'], coglink, filename)
-                        except:
-                            await ctx.send(self.bot.bot_prefix + "Wrong GitHub account credentials.")
-                with open("custom_cogs/" + filename, "wb+") as f:
-                    f.write(download.encode("utf-8"))
-                try:
-                    self.bot.unload_extension("custom_cogs." + filename.rsplit(".", 1)[0])
-                    self.bot.load_extension("custom_cogs." + filename.rsplit(".", 1)[0])
-                    await ctx.send(self.bot.bot_prefix + "Successfully downloaded the `{}` cog.".format(cog["title"]))
-                except Exception as e:
-                    os.remove("custom_cogs/" + filename)
-                    await ctx.send(self.bot.bot_prefix + "There was an error loading your cog: `{}: {}` You may want to report this error to the author of the cog.".format(type(e).__name__, str(e)))
-            else:
-                await ctx.send(self.bot.bot_prefix + "Didn't download `{}`: user cancelled.".format(cog["title"]))
+    @repo.command(name="remove")
+    async def _repo_del(self, repo_name: str):
+        """Removes repo from repo list. COGS ARE NOT REMOVED."""
+        def remove_readonly(func, path, excinfo):
+            os.chmod(path, 0o755)
+            func(path)
 
-    @cog.command(pass_context=True)
-    async def uninstall(self, ctx, cog):
-        """Uninstall one of your custom ASCII cogs."""
-        def check(msg):
-            if msg:
-                return (msg.content.lower().strip() == 'y' or msg.content.lower().strip() == 'n') and msg.author == self.bot.user
-            else:
-                return False
+        if repo_name not in self.repos:
+            await self.bot.say("That repo doesn't exist.")
+            return
+        del self.repos[repo_name]
+        try:
+            shutil.rmtree(os.path.join(self.path, repo_name), onerror=remove_readonly)
+        except FileNotFoundError:
+            pass
+        self.save_repos()
+        await self.bot.say("Repo '{}' removed.".format(repo_name))
 
-        await ctx.message.delete()
-        response = requests.get("https://lyricly.github.io/ASCII/cogs/{}.json".format(cog))
-        if response.status_code == 404:
-            await ctx.send(self.bot.bot_prefix + "That's not a real cog!")
-        else:
-            found_cog = response.json()
-            filename = found_cog["link"].rsplit("/",1)[1].rsplit(".",1)[0]
-            if os.path.isfile("custom_cogs/" + filename + ".py"):
-                embed = discord.Embed(title=found_cog["title"], description=found_cog["description"])
-                embed.set_author(name=found_cog["author"])
-                await ctx.send(self.bot.bot_prefix + "Are you sure you want to delete this cog? (y/n)", embed=embed)
-                reply = await self.bot.wait_for("message", check=check)
-                if reply.content.lower() == "y":
-                    os.remove("custom_cogs/" + filename + ".py")
-                    self.bot.unload_extension("custom_cogs." + filename)
-                    await ctx.send(self.bot.bot_prefix + "Successfully deleted the `{}` cog.".format(found_cog["title"]))
+    @cog.command(name="list")
+    async def _send_list(self, repo_name=None):
+        """Lists installable cogs
+        Repositories list:
+        https://twentysix26.github.io/Red-Docs/red_cog_approved_repos/"""
+        retlist = []
+        if repo_name and repo_name in self.repos:
+            msg = "Available cogs:\n"
+            for cog in sorted(self.repos[repo_name].keys()):
+                if 'url' == cog:
+                    continue
+                data = self.get_info_data(repo_name, cog)
+                if data and data.get("HIDDEN") is True:
+                    continue
+                if data:
+                    retlist.append([cog, data.get("SHORT", "")])
                 else:
-                    await ctx.send(self.bot.bot_prefix + "Didn't delete `{}`: user cancelled.".format(found_cog["title"]))
+                    retlist.append([cog, ''])
+        else:
+            if self.repos:
+                msg = "Available repos:\n"
+                for repo_name in sorted(self.repos.keys()):
+                    data = self.get_info_data(repo_name)
+                    if data:
+                        retlist.append([repo_name, data.get("SHORT", "")])
+                    else:
+                        retlist.append([repo_name, ""])
             else:
-                await ctx.send(self.bot.bot_prefix + "You don't have `{}` installed!".format(found_cog["title"]))
+                await self.bot.say("You haven't added a repository yet.\n"
+                                   "Start now! {}".format(REPOS_LIST))
+                return
 
-    @cog.command(pass_context=True)
-    async def list(self, ctx):
-        """List all cogs on ASCII."""
-        await ctx.message.delete()
-        site = requests.get('https://github.com/LyricLy/ASCII/tree/master/cogs').text
-        soup = BeautifulSoup(site, "lxml")
-        data = soup.find_all(attrs={"class": "js-navigation-open"})
-        list_ = []
-        for a in data:
-            list_.append(a.get("title"))
-        installed = []
-        uninstalled = []
-        for entry in list_[3:]:
-            response = requests.get("https://lyricly.github.io/ASCII/cogs/{}".format(entry))
-            found_cog = response.json()
-            filename = found_cog["link"].rsplit("/",1)[1].rsplit(".",1)[0]
-            if os.path.isfile("custom_cogs/" + filename + ".py"):
-                installed.append(entry.rsplit(".",1)[0])
+        col_width = max(len(row[0]) for row in retlist) + 2
+        for row in retlist:
+            msg += "\t" + "".join(word.ljust(col_width) for word in row) + "\n"
+        msg += "\nRepositories list: {}".format(REPOS_LIST)
+        for page in pagify(msg, delims=['\n'], shorten_by=8):
+            await self.bot.say(box(page))
+
+    @cog.command()
+    async def info(self, repo_name: str, cog: str=None):
+        """Shows info about the specified cog"""
+        if cog is not None:
+            cogs = self.list_cogs(repo_name)
+            if cog in cogs:
+                data = self.get_info_data(repo_name, cog)
+                if data:
+                    msg = "{} by {}\n\n".format(cog, data["AUTHOR"])
+                    msg += data["NAME"] + "\n\n" + data["DESCRIPTION"]
+                    await self.bot.say(box(msg))
+                else:
+                    await self.bot.say("The specified cog has no info file.")
             else:
-                uninstalled.append(entry.rsplit(".",1)[0])
-        embed = discord.Embed(title="List of ASCII cogs")
-        if installed:
-            embed.add_field(name="Installed", value="\n".join(installed), inline=True)
+                await self.bot.say("That cog doesn't exist."
+                                   " Use cog list to see the full list.")
         else:
-            embed.add_field(name="Installed", value="None!", inline=True)
-        if uninstalled:
-            embed.add_field(name="Not installed", value="\n".join(uninstalled), inline=True)
-        else:
-            embed.add_field(name="Not installed", value="None!", inline=True)
-        embed.set_footer(text=">help cog for more information.")
-        await ctx.send("", embed=embed)
+            data = self.get_info_data(repo_name)
+            if data is None:
+                await self.bot.say("That repo does not exist or the"
+                                   " information file is missing for that repo"
+                                   ".")
+                return
+            name = data.get("NAME", None)
+            name = repo_name if name is None else name
+            author = data.get("AUTHOR", "Unknown")
+            desc = data.get("DESCRIPTION", "")
+            msg = ("```{} by {}```\n\n{}".format(name, author, desc))
+            await self.bot.say(msg)
 
-    @cog.command(pass_context=True)
-    async def view(self, ctx, cog):
-        """View information about a cog on ASCII."""
-        await ctx.message.delete()
-        response = requests.get("https://lyricly.github.io/ASCII/cogs/{}.json".format(cog))
-        if response.status_code == 404:
-            await ctx.send(self.bot.bot_prefix + "That cog couldn't be found on the network. Check your spelling and try again.")
-        else:
-            cog = response.json()
-            embed = discord.Embed(title=cog["title"], description=cog["description"])
-            embed.set_author(name=cog["author"])
-            await ctx.send(embed=embed)
+    @cog.command(hidden=True)
+    async def search(self, *terms: str):
+        """Search installable cogs"""
+        pass  # TO DO
 
     @cog.command(pass_context=True)
     async def update(self, ctx):
-        """Update all of your installed ASCII cogs."""
-        await ctx.message.delete()
-        msg = await ctx.send(self.bot.bot_prefix + "Updating...")
-        async with self.bot.session.get('https://github.com/LyricLy/ASCII/tree/master/cogs') as resp:
-            site = await resp.text()
-        soup = BeautifulSoup(site, "lxml")
-        data = soup.find_all(attrs={"class": "js-navigation-open"})
-        list = []
-        for a in data:
-            list.append(a.get("title"))
-        embed = discord.Embed(title="Cog list", description="")
-        successful = 0
-        failures = 0
-        for entry in list[2:]:
-            entry = entry.rsplit(".")[0]
-            if os.path.isfile("custom_cogs/" + entry + ".py"):
-                async with self.bot.session.get("https://lyricly.github.io/ASCII/cogs/{}.json".format(entry)) as resp:
-                    cog = await resp.json()
-                    link = cog["link"]
-                async with self.bot.session.get(link) as resp:
-                    download = await resp.text()
-                filename = link.rsplit("/", 1)[1]
-                with open("custom_cogs/" + filename, "wb+") as f:
-                    f.write(download.encode("utf-8"))
+        """Updates cogs"""
+
+        tasknum = 0
+        num_repos = len(self.repos)
+
+        min_dt = 0.5
+        burst_inc = 0.1/(NUM_THREADS)
+        touch_n = tasknum
+        touch_t = time()
+
+        def regulate(touch_t, touch_n):
+            dt = time() - touch_t
+            if dt + burst_inc*(touch_n) > min_dt:
+                touch_n = 0
+                touch_t = time()
+                return True, touch_t, touch_n
+            return False, touch_t, touch_n + 1
+
+        tasks = []
+        for r in self.repos:
+            task = partial(self.update_repo, r)
+            task = self.bot.loop.run_in_executor(self.executor, task)
+            tasks.append(task)
+
+        base_msg = "Downloading updated cogs, please wait... "
+        status = ' %d/%d repos updated' % (tasknum, num_repos)
+        msg = await self.bot.say(base_msg + status)
+
+        updated_cogs = []
+        new_cogs = []
+        deleted_cogs = []
+        failed_cogs = []
+        error_repos = {}
+        installed_updated_cogs = []
+
+        for f in as_completed(tasks):
+            tasknum += 1
+            try:
+                name, updates, oldhash = await f
+                if updates:
+                    if type(updates) is dict:
+                        for k, l in updates.items():
+                            tl = [(name, c, oldhash) for c in l]
+                            if k == 'A':
+                                new_cogs.extend(tl)
+                            elif k == 'D':
+                                deleted_cogs.extend(tl)
+                            elif k == 'M':
+                                updated_cogs.extend(tl)
+            except UpdateError as e:
+                name, what = e.args
+                error_repos[name] = what
+            edit, touch_t, touch_n = regulate(touch_t, touch_n)
+            if edit:
+                status = ' %d/%d repos updated' % (tasknum, num_repos)
+                msg = await self._robust_edit(msg, base_msg + status)
+        status = 'done. '
+
+        for t in updated_cogs:
+            repo, cog, _ = t
+            if self.repos[repo][cog]['INSTALLED']:
                 try:
-                    self.bot.unload_extension("custom_cogs." + filename.rsplit(".", 1)[0])
-                    self.bot.load_extension("custom_cogs." + filename.rsplit(".", 1)[0])
-                    successful += 1
-                except Exception as e:
-                    failures += 1
-                    os.remove("custom_cogs/" + filename)
-                    await ctx.send(self.bot.bot_prefix + "There was an error updating the `{}` cog: `{}: {}` You may want to report this error to the author of the cog.".format(cog["title"], type(e).__name__, str(e)))
-        if failures == 0:
-            await msg.edit(content=self.bot.bot_prefix + "Updated all cogs successfully.")
+                    await self.install(repo, cog,
+                                       no_install_on_reqs_fail=False)
+                except RequirementFail:
+                    failed_cogs.append(t)
+                else:
+                    installed_updated_cogs.append(t)
+
+        for t in updated_cogs.copy():
+            if t in failed_cogs:
+                updated_cogs.remove(t)
+
+        if not any(self.repos[repo][cog]['INSTALLED'] for
+                   repo, cog, _ in updated_cogs):
+            status += ' No updates to apply. '
+
+        if new_cogs:
+            status += '\nNew cogs: ' \
+                   + ', '.join('%s/%s' % c[:2] for c in new_cogs) + '.'
+        if deleted_cogs:
+            status += '\nDeleted cogs: ' \
+                   + ', '.join('%s/%s' % c[:2] for c in deleted_cogs) + '.'
+        if updated_cogs:
+            status += '\nUpdated cogs: ' \
+                   + ', '.join('%s/%s' % c[:2] for c in updated_cogs) + '.'
+        if failed_cogs:
+            status += '\nCogs that got new requirements which have ' + \
+                   'failed to install: ' + \
+                   ', '.join('%s/%s' % c[:2] for c in failed_cogs) + '.'
+        if error_repos:
+            status += '\nThe following repos failed to update: '
+            for n, what in error_repos.items():
+                status += '\n%s: %s' % (n, what)
+
+        msg = await self._robust_edit(msg, base_msg + status)
+
+        if not installed_updated_cogs:
+            return
+
+        patchnote_lang = 'Prolog'
+        shorten_by = 8 + len(patchnote_lang)
+        for note in self.patch_notes_handler(installed_updated_cogs):
+            if note is None:
+                continue
+            for page in pagify(note, delims=['\n'], shorten_by=shorten_by):
+                await self.bot.say(box(page, patchnote_lang))
+
+        await self.bot.say("Cogs updated. Reload updated cogs? (yes/no)")
+        answer = await self.bot.wait_for_message(timeout=15,
+                                                 author=ctx.message.author)
+        if answer is None:
+            await self.bot.say("Ok then, you can reload cogs with"
+                               " `{}reload <cog_name>`".format(ctx.prefix))
+        elif answer.content.lower().strip() == "yes":
+            registry = dataIO.load_json(os.path.join("data", "red", "cogs.json"))
+            update_list = []
+            fail_list = []
+            for repo, cog, _ in installed_updated_cogs:
+                if not registry.get('cogs.' + cog, False):
+                    continue
+                try:
+                    self.bot.unload_extension("cogs." + cog)
+                    self.bot.load_extension("cogs." + cog)
+                    update_list.append(cog)
+                except:
+                    fail_list.append(cog)
+            msg = 'Done.'
+            if update_list:
+                msg += " The following cogs were reloaded: "\
+                    + ', '.join(update_list) + "\n"
+            if fail_list:
+                msg += " The following cogs failed to reload: "\
+                    + ', '.join(fail_list)
+            await self.bot.say(msg)
+
         else:
-            await ctx.send(self.bot.bot_prefix + "Updated {}/{} cogs successfully.".format(successful, successful + failures))
+            await self.bot.say("Ok then, you can reload cogs with"
+                               " `{}reload <cog_name>`".format(ctx.prefix))
+
+    def patch_notes_handler(self, repo_cog_hash_pairs):
+        for repo, cog, oldhash in repo_cog_hash_pairs:
+            repo_path = os.path.join('data', 'downloader', repo)
+            cogfile = os.path.join(cog, cog + ".py")
+            cmd = ["git", "-C", repo_path, "log", "--relative-date",
+                   "--reverse", oldhash + '..', cogfile
+                   ]
+            try:
+                log = sp_run(cmd, stdout=PIPE).stdout.decode().strip()
+                yield self.format_patch(repo, cog, log)
+            except:
+                pass
+
+    @cog.command(pass_context=True)
+    async def uninstall(self, ctx, repo_name, cog):
+        """Uninstalls a cog"""
+        if repo_name not in self.repos:
+            await self.bot.say("That repo doesn't exist.")
+            return
+        if cog not in self.repos[repo_name]:
+            await self.bot.say("That cog isn't available from that repo.")
+            return
+        set_cog("cogs." + cog, False)
+        self.repos[repo_name][cog]['INSTALLED'] = False
+        self.save_repos()
+        os.remove(os.path.join("cogs", cog + ".py"))
+        owner = self.bot.get_cog('Owner')
+        await owner.unload.callback(owner, cog_name=cog)
+        await self.bot.say("Cog successfully uninstalled.")
+
+    @cog.command(name="install", pass_context=True)
+    async def _install(self, ctx, repo_name: str, cog: str):
+        """Installs specified cog"""
+        if repo_name not in self.repos:
+            await self.bot.say("That repo doesn't exist.")
+            return
+        if cog not in self.repos[repo_name]:
+            await self.bot.say("That cog isn't available from that repo.")
+            return
+        data = self.get_info_data(repo_name, cog)
+        try:
+            install_cog = await self.install(repo_name, cog, notify_reqs=True)
+        except RequirementFail:
+            await self.bot.say("That cog has requirements that I could not "
+                               "install. Check the console for more "
+                               "informations.")
+            return
+        if data is not None:
+            install_msg = data.get("INSTALL_MSG", None)
+            if install_msg:
+                await self.bot.say(install_msg[:2000])
+        if install_cog:
+            await self.bot.say("Installation completed. Load it now? (yes/no)")
+            answer = await self.bot.wait_for_message(timeout=15,
+                                                     author=ctx.message.author)
+            if answer is None:
+                await self.bot.say("Ok then, you can load it with"
+                                   " `{}load {}`".format(ctx.prefix, cog))
+            elif answer.content.lower().strip() == "yes":
+                set_cog("cogs." + cog, True)
+                owner = self.bot.get_cog('Owner')
+                await owner.load.callback(owner, cog_name=cog)
+            else:
+                await self.bot.say("Ok then, you can load it with"
+                                   " `{}load {}`".format(ctx.prefix, cog))
+        elif install_cog is False:
+            await self.bot.say("Invalid cog. Installation aborted.")
+        else:
+            await self.bot.say("That cog doesn't exist. Use cog list to see"
+                               " the full list.")
+
+    async def install(self, repo_name, cog, *, notify_reqs=False,
+                      no_install_on_reqs_fail=True):
+        # 'no_install_on_reqs_fail' will make the cog get installed anyway
+        # on requirements installation fail. This is necessary because due to
+        # how 'cog update' works right now, the user would have no way to
+        # reupdate the cog if the update fails, since 'cog update' only
+        # updates the cogs that get a new commit.
+        # This is not a great way to deal with the problem and a cog update
+        # rework would probably be the best course of action.
+        reqs_failed = False
+        if cog.endswith('.py'):
+            cog = cog[:-3]
+
+        path = self.repos[repo_name][cog]['file']
+        cog_folder_path = self.repos[repo_name][cog]['folder']
+        cog_data_path = os.path.join(cog_folder_path, 'data')
+        data = self.get_info_data(repo_name, cog)
+        if data is not None:
+            requirements = data.get("REQUIREMENTS", [])
+
+            requirements = [r for r in requirements
+                            if not self.is_lib_installed(r)]
+
+            if requirements and notify_reqs:
+                await self.bot.say("Installing cog's requirements...")
+
+            for requirement in requirements:
+                if not self.is_lib_installed(requirement):
+                    success = await self.bot.pip_install(requirement)
+                    if not success:
+                        if no_install_on_reqs_fail:
+                            raise RequirementFail()
+                        else:
+                            reqs_failed = True
+
+        to_path = os.path.join("cogs", cog + ".py")
+
+        print("Copying {}...".format(cog))
+        shutil.copy(path, to_path)
+
+        if os.path.exists(cog_data_path):
+            print("Copying {}'s data folder...".format(cog))
+            distutils.dir_util.copy_tree(cog_data_path,
+                                         os.path.join('data', cog))
+        self.repos[repo_name][cog]['INSTALLED'] = True
+        self.save_repos()
+        if not reqs_failed:
+            return True
+        else:
+            raise RequirementFail()
+
+    def get_info_data(self, repo_name, cog=None):
+        if cog is not None:
+            cogs = self.list_cogs(repo_name)
+            if cog in cogs:
+                info_file = os.path.join(cogs[cog].get('folder'), "info.json")
+                if os.path.isfile(info_file):
+                    try:
+                        data = dataIO.load_json(info_file)
+                    except:
+                        return None
+                    return data
+        else:
+            repo_info = os.path.join(self.path, repo_name, 'info.json')
+            if os.path.isfile(repo_info):
+                try:
+                    data = dataIO.load_json(repo_info)
+                    return data
+                except:
+                    return None
+        return None
+
+    def list_cogs(self, repo_name):
+        valid_cogs = {}
+
+        repo_path = os.path.join(self.path, repo_name)
+        folders = [f for f in os.listdir(repo_path)
+                   if os.path.isdir(os.path.join(repo_path, f))]
+        legacy_path = os.path.join(repo_path, "cogs")
+        legacy_folders = []
+        if os.path.exists(legacy_path):
+            for f in os.listdir(legacy_path):
+                if os.path.isdir(os.path.join(legacy_path, f)):
+                    legacy_folders.append(os.path.join("cogs", f))
+
+        folders = folders + legacy_folders
+
+        for f in folders:
+            cog_folder_path = os.path.join(self.path, repo_name, f)
+            cog_folder = os.path.basename(cog_folder_path)
+            for cog in os.listdir(cog_folder_path):
+                cog_path = os.path.join(cog_folder_path, cog)
+                if os.path.isfile(cog_path) and cog_folder == cog[:-3]:
+                    valid_cogs[cog[:-3]] = {'folder': cog_folder_path,
+                                            'file': cog_path}
+        return valid_cogs
+
+    def get_dir_name(self, url):
+        splitted = url.split("/")
+        git_name = splitted[-1]
+        return git_name[:-4]
+
+    def is_lib_installed(self, name):
+        try:
+            return bool(find_spec(name))
+        except ImportError:
+            return False
+
+    def _do_first_run(self):
+        save = False
+        repos_copy = deepcopy(self.repos)
+
+        # Issue 725
+        for repo in repos_copy:
+            for cog in repos_copy[repo]:
+                cog_data = repos_copy[repo][cog]
+                if isinstance(cog_data, str):  # ... url field
+                    continue
+                for k, v in cog_data.items():
+                    if k in ("file", "folder"):
+                        repos_copy[repo][cog][k] = os.path.normpath(cog_data[k])
+
+        if self.repos != repos_copy:
+            self.repos = repos_copy
+            save = True
+
+        invalid = []
+
+        for repo in self.repos:
+            broken = 'url' in self.repos[repo] and len(self.repos[repo]) == 1
+            if broken:
+                save = True
+                try:
+                    self.update_repo(repo)
+                    self.populate_list(repo)
+                except CloningError:
+                    invalid.append(repo)
+                    continue
+                except Exception as e:
+                    print(e) # TODO: Proper logging
+                    continue
+
+        for repo in invalid:
+            del self.repos[repo]
+
+        if save:
+            self.save_repos()
+
+    def populate_list(self, name):
+        valid_cogs = self.list_cogs(name)
+        new = set(valid_cogs.keys())
+        old = set(self.repos[name].keys())
+        for cog in new - old:
+            self.repos[name][cog] = valid_cogs.get(cog, {})
+            self.repos[name][cog]['INSTALLED'] = False
+        for cog in new & old:
+            self.repos[name][cog].update(valid_cogs[cog])
+        for cog in old - new:
+            if cog != 'url':
+                del self.repos[name][cog]
+
+    def update_repo(self, name):
+
+        def run(*args, **kwargs):
+            env = os.environ.copy()
+            env['GIT_TERMINAL_PROMPT'] = '0'
+            kwargs['env'] = env
+            return sp_run(*args, **kwargs)
+
+        try:
+            dd = self.path
+            if name not in self.repos:
+                raise UpdateError("Repo does not exist in data, wtf")
+            folder = os.path.join(dd, name)
+            # Make sure we don't git reset the Red folder on accident
+            if not os.path.exists(os.path.join(folder, '.git')):
+                #if os.path.exists(folder):
+                    #shutil.rmtree(folder)
+                url = self.repos[name].get('url')
+                if not url:
+                    raise UpdateError("Need to clone but no URL set")
+                branch = None
+                if "@" in url: # Specific branch
+                    url, branch = url.rsplit("@", maxsplit=1)
+                if branch is None:
+                    p = run(["git", "clone", url, folder])
+                else:
+                    p = run(["git", "clone", "-b", branch, url, folder])
+                if p.returncode != 0:
+                    raise CloningError()
+                self.populate_list(name)
+                return name, REPO_CLONE, None
+            else:
+                rpbcmd = ["git", "-C", folder, "rev-parse", "--abbrev-ref", "HEAD"]
+                p = run(rpbcmd, stdout=PIPE)
+                branch = p.stdout.decode().strip()
+
+                rpcmd = ["git", "-C", folder, "rev-parse", branch]
+                p = run(["git", "-C", folder, "reset", "--hard",
+                        "origin/%s" % branch, "-q"])
+                if p.returncode != 0:
+                    raise UpdateError("Error resetting to origin/%s" % branch)
+                p = run(rpcmd, stdout=PIPE)
+                if p.returncode != 0:
+                    raise UpdateError("Unable to determine old commit hash")
+                oldhash = p.stdout.decode().strip()
+                p = run(["git", "-C", folder, "pull", "-q", "--ff-only"])
+                if p.returncode != 0:
+                    raise UpdateError("Error pulling updates")
+                p = run(rpcmd, stdout=PIPE)
+                if p.returncode != 0:
+                    raise UpdateError("Unable to determine new commit hash")
+                newhash = p.stdout.decode().strip()
+                if oldhash == newhash:
+                    return name, REPO_SAME, None
+                else:
+                    self.populate_list(name)
+                    self.save_repos()
+                    ret = {}
+                    cmd = ['git', '-C', folder, 'diff', '--no-commit-id',
+                           '--name-status', oldhash, newhash]
+                    p = run(cmd, stdout=PIPE)
+
+                    if p.returncode != 0:
+                        raise UpdateError("Error in git diff")
+
+                    changed = p.stdout.strip().decode().split('\n')
+
+                    for f in changed:
+                        if not f.endswith('.py'):
+                            continue
+
+                        status, _, cogpath = f.partition('\t')
+                        split = os.path.split(cogpath)
+                        cogdir, cogname = split[-2:]
+                        cogname = cogname[:-3]  # strip .py
+
+                        if len(split) != 2 or cogdir != cogname:
+                            continue
+
+                        if status not in ret:
+                            ret[status] = []
+                        ret[status].append(cogname)
+
+                    return name, ret, oldhash
+
+        except CloningError as e:
+            raise CloningError(name, *e.args) from None
+        except UpdateError as e:
+            raise UpdateError(name, *e.args) from None
+
+    async def _robust_edit(self, msg, text):
+        try:
+            msg = await self.bot.edit_message(msg, text)
+        except discord.errors.NotFound:
+            msg = await self.bot.send_message(msg.channel, text)
+        except:
+            raise
+        return msg
+
+    @staticmethod
+    def format_patch(repo, cog, log):
+        header = "Patch Notes for %s/%s" % (repo, cog)
+        line = "=" * len(header)
+        if log:
+            return '\n'.join((header, line, log))
+
+
+def check_folders():
+    if not os.path.exists(os.path.join("data", "downloader")):
+        print('Making repo downloads folder...')
+        os.mkdir(os.path.join("data", "downloader"))
+
+
+def check_files():
+    f = os.path.join("data", "downloader", "repos.json")
+    if not dataIO.is_valid_json(f):
+        print("Creating default data/downloader/repos.json")
+        dataIO.save_json(f, {})
+
 
 def setup(bot):
-    bot.add_cog(CogDownloading(bot))
+    check_folders()
+    check_files()
+    n = Downloader(bot)
+    bot.add_cog(n)
